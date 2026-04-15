@@ -22,11 +22,17 @@ import sys
 import pathlib
 import importlib
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+PYTHON_ROOT = REPO_ROOT / "klayout_package" / "python"
+if str(PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(PYTHON_ROOT))
+
 from kqcircuits.klayout_view import KLayoutView
 from kqcircuits.util.error_on_cell import formatted_errors_on_cells
 from kqcircuits.util.log_router import route_log
 from kqcircuits.defaults import TMP_PATH
 from kqcircuits.util.plugin_startup import register_plugins
+from kqcircuits.util.library_helper import load_libraries
 
 # Script to create a KQCircuits element in KLayout by specifying the path to the module file containing the element.
 # This script can be used to integrate with external editors.
@@ -160,6 +166,9 @@ if len(element_classes) == 1:
     cls = element_classes[0]
 else:
     raise ValueError("Expecting exactly one class in the module to run.")
+
+importlib.invalidate_caches()
+load_libraries(flush=True)
 
 view = KLayoutView()
 view.insert_cell(cls)
