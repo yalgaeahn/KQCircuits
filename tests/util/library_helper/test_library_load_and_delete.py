@@ -25,6 +25,7 @@ from pathlib import Path
 from kqcircuits.pya_resolver import pya
 import kqcircuits.defaults as defaults
 import kqcircuits.util.library_helper as library_helper
+from kqcircuits.util.source_path_helper import ensure_source_path_parents_on_sys_path, get_source_paths
 
 from kqcircuits.util.library_helper import load_libraries, delete_library, delete_all_libraries
 
@@ -123,6 +124,33 @@ def test_load_all_with_external_source_root(monkeypatch, tmp_path):
         monkeypatch.delenv("KQC_EXTRA_SRC_PATHS", raising=False)
         importlib.reload(defaults)
         importlib.reload(library_helper)
+
+
+def test_load_all_with_auto_detected_scdevice_source_root(tmp_path):
+    scdevice_root = tmp_path / "SCDevice"
+    package_root = _create_external_package(scdevice_root)
+    kqcircuits_source_root = scdevice_root / "KQCircuits" / "klayout_package" / "python" / "kqcircuits"
+    kqcircuits_source_root.mkdir(parents=True)
+
+    original_defaults_source_paths = defaults.SRC_PATHS
+    original_library_helper_source_paths = library_helper.SRC_PATHS
+    source_paths = get_source_paths(kqcircuits_source_root, raw_value="")
+    ensure_source_path_parents_on_sys_path(source_paths)
+
+    try:
+        defaults.SRC_PATHS = source_paths
+        library_helper.SRC_PATHS = source_paths
+        library_helper.load_libraries(flush=True)
+        chip_pcells = library_helper.load_libraries()["Chip Library"].layout().pcell_names()
+        qubit_pcells = library_helper.load_libraries()["Qubit Library"].layout().pcell_names()
+
+        assert package_root in source_paths
+        assert "Sqnl Launchers" in chip_pcells
+        assert "Double Pads SQNL" in qubit_pcells
+    finally:
+        library_helper.delete_all_libraries()
+        defaults.SRC_PATHS = original_defaults_source_paths
+        library_helper.SRC_PATHS = original_library_helper_source_paths
 
 
 def _create_external_package(tmp_path):

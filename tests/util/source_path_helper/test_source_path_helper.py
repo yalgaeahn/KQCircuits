@@ -19,7 +19,7 @@
 import os
 from pathlib import Path
 
-from kqcircuits.util.source_path_helper import get_extra_source_paths, resolve_module_path
+from kqcircuits.util.source_path_helper import get_extra_source_paths, get_scdevice_source_paths, get_source_paths, resolve_module_path
 
 
 def test_get_extra_source_paths_returns_empty_without_environment(monkeypatch):
@@ -36,6 +36,37 @@ def test_get_extra_source_paths_parses_multiple_directories(monkeypatch, tmp_pat
     monkeypatch.setenv("KQC_EXTRA_SRC_PATHS", os.pathsep.join((str(first), str(second))))
 
     assert get_extra_source_paths() == [first.resolve(), second.resolve()]
+
+
+def test_get_scdevice_source_paths_detects_sibling_package(tmp_path):
+    kqcircuits_source_root = _create_scdevice_layout(tmp_path)
+
+    assert get_scdevice_source_paths(kqcircuits_source_root) == [(tmp_path / "scdevice_pcells").resolve()]
+
+
+def test_get_scdevice_source_paths_returns_empty_without_sibling_package(tmp_path):
+    kqcircuits_source_root = _create_kqcircuits_source_root(tmp_path)
+
+    assert get_scdevice_source_paths(kqcircuits_source_root) == []
+
+
+def test_get_source_paths_appends_auto_detected_scdevice_root_without_env(tmp_path):
+    kqcircuits_source_root = _create_scdevice_layout(tmp_path)
+
+    assert get_source_paths(kqcircuits_source_root, raw_value="") == [
+        kqcircuits_source_root.resolve(),
+        (tmp_path / "scdevice_pcells").resolve(),
+    ]
+
+
+def test_get_source_paths_dedupes_env_and_auto_detected_scdevice_root(tmp_path):
+    kqcircuits_source_root = _create_scdevice_layout(tmp_path)
+    scdevice_source_root = (tmp_path / "scdevice_pcells").resolve()
+
+    assert get_source_paths(kqcircuits_source_root, raw_value=str(scdevice_source_root)) == [
+        kqcircuits_source_root.resolve(),
+        scdevice_source_root,
+    ]
 
 
 def test_resolve_module_path_accepts_registered_relative_paths():
@@ -57,3 +88,15 @@ def test_resolve_module_path_accepts_absolute_paths(tmp_path):
     module_path.touch()
 
     assert resolve_module_path(str(module_path), [package_root]) == "scdevice_pcells.qubits.double_pads_sqnl"
+
+
+def _create_scdevice_layout(tmp_path):
+    package_root = (tmp_path / "scdevice_pcells").resolve()
+    package_root.mkdir()
+    return _create_kqcircuits_source_root(tmp_path)
+
+
+def _create_kqcircuits_source_root(tmp_path):
+    kqcircuits_source_root = tmp_path / "KQCircuits" / "klayout_package" / "python" / "kqcircuits"
+    kqcircuits_source_root.mkdir(parents=True, exist_ok=True)
+    return kqcircuits_source_root.resolve()

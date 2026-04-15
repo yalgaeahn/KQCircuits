@@ -23,6 +23,22 @@ import sys
 from pathlib import Path
 
 
+def get_source_paths(primary_source_path, raw_value=None):
+    """Collect all configured source roots in precedence order."""
+    primary_source_path = Path(primary_source_path).resolve()
+    source_paths = [primary_source_path]
+
+    for candidate in get_extra_source_paths(raw_value):
+        if candidate not in source_paths:
+            source_paths.append(candidate)
+
+    for candidate in get_scdevice_source_paths(primary_source_path):
+        if candidate not in source_paths:
+            source_paths.append(candidate)
+
+    return source_paths
+
+
 def get_extra_source_paths(raw_value=None):
     """Parse extra source roots from ``KQC_EXTRA_SRC_PATHS`` style values."""
     if raw_value is None:
@@ -38,6 +54,28 @@ def get_extra_source_paths(raw_value=None):
             source_paths.append(source_path)
 
     return source_paths
+
+
+def get_scdevice_source_paths(primary_source_path):
+    """Auto-discover sibling source roots for the SCDevice umbrella layout."""
+    primary_source_path = Path(primary_source_path).resolve()
+    if len(primary_source_path.parts) < 4:
+        return []
+
+    if not (
+        primary_source_path.name == "kqcircuits"
+        and primary_source_path.parent.name == "python"
+        and primary_source_path.parent.parent.name == "klayout_package"
+        and primary_source_path.parent.parent.parent.name == "KQCircuits"
+    ):
+        return []
+
+    scdevice_root = primary_source_path.parent.parent.parent.parent
+    scdevice_source_root = (scdevice_root / "scdevice_pcells").resolve()
+    if scdevice_source_root.is_dir():
+        return [scdevice_source_root]
+
+    return []
 
 
 def ensure_source_path_parents_on_sys_path(source_paths):
