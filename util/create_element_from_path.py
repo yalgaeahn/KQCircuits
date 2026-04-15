@@ -28,11 +28,12 @@ if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
 from kqcircuits.klayout_view import KLayoutView
+from kqcircuits.defaults import SRC_PATHS, TMP_PATH
 from kqcircuits.util.error_on_cell import formatted_errors_on_cells
 from kqcircuits.util.log_router import route_log
-from kqcircuits.defaults import TMP_PATH
 from kqcircuits.util.plugin_startup import register_plugins
 from kqcircuits.util.library_helper import load_libraries
+from kqcircuits.util.source_path_helper import resolve_module_path
 
 # Script to create a KQCircuits element in KLayout by specifying the path to the module file containing the element.
 # This script can be used to integrate with external editors.
@@ -45,8 +46,9 @@ from kqcircuits.util.library_helper import load_libraries
 #  -rx: Skip running automatic startup scripts (avoids creating a second empty layout)
 #  -rm: Run this script on startup
 #  -rd: Inject a variable element_path into the script scope containing the path of the element module to create.
-#       element_path should be relative to the kqcircuits repository, and it should be a module containing exactly
-#       one KQCircuits Element or Chip.
+#       element_path should point to a Python module containing exactly one KQCircuits Element or Chip. The path may be
+#       relative to a registered package root such as kqcircuits/ or scdevice_pcells/, or it may be an absolute path
+#       under one of the configured source roots.
 #
 # To use this as an external tool in Pycharm:
 # - Under Settings -> Tools -> External Tools create a new entry as follows:
@@ -135,17 +137,7 @@ route_log(lowest_visible_level="INFO", filename=f"{TMP_PATH}/kqc.log")
 logging.info(f"Element path: {element_path}")
 
 # Figure out the python import path from the specified file path
-path_without_extension = pathlib.Path(element_path).with_suffix("")
-# Remove 'KQCircuits' or similar folder from beginning
-for idx, part in reversed(list(enumerate(path_without_extension.parts))):
-    if "Circuits" in part:
-        path_without_extension = path_without_extension.relative_to(*path_without_extension.parts[: idx + 1])
-
-if path_without_extension.parts[0] == "klayout_package" and path_without_extension.parts[1] == "python":
-    module_path = ".".join(path_without_extension.parts[2:])
-else:
-    module_path = ".".join(path_without_extension.parts)
-module_name = path_without_extension.name
+module_path = resolve_module_path(element_path, SRC_PATHS)
 
 # Import module
 module = importlib.import_module(module_path)

@@ -28,6 +28,7 @@ from pathlib import Path
 from kqcircuits.pya_resolver import pya
 from kqcircuits.util.defaults_helper import find_ansys_executable
 from kqcircuits.util.import_helper import module_from_file
+from kqcircuits.util.source_path_helper import ensure_source_path_parents_on_sys_path, get_extra_source_paths
 
 
 _kqcircuits_path = Path(os.path.dirname(os.path.realpath(__file__)))
@@ -37,6 +38,11 @@ if os.name == "nt" and os.path.islink(Path(__file__).parent):
 
 # project paths
 SRC_PATHS = [_kqcircuits_path]
+for _extra_source_path in get_extra_source_paths():
+    if _extra_source_path not in SRC_PATHS:
+        SRC_PATHS.append(_extra_source_path)
+ensure_source_path_parents_on_sys_path(SRC_PATHS)
+
 ROOT_PATH = Path(os.getenv("KQC_ROOT_PATH", os.getcwd()))  # "current dir" or set by optional KQC_ROOT_PATH
 if _kqcircuits_path.parts[-3] == "klayout_package":  # developer setup
     ROOT_PATH = _kqcircuits_path.parents[2]
