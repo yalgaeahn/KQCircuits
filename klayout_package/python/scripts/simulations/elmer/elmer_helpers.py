@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from gmsh_helpers import get_elmer_layers, MESH_LAYER_PREFIX, get_metal_layers, apply_elmer_layer_prefix
 
-from scipy.constants import epsilon_0
+from scipy.constants import epsilon_0, mu_0
 from scipy.signal import find_peaks
 import numpy as np
 import pandas as pd
@@ -80,6 +80,7 @@ def sif_common_header(
     output_file: str | None = None,
     restart_file: str | None = None,
     restart_position: int | None = None,
+    additional_simulation_lines: list[str] | None = None,
 ) -> str:
     """
     Returns common header and simulation blocks of a sif file in string format.
@@ -124,7 +125,8 @@ def sif_common_header(
         + ([] if angular_frequency is None else [f"Angular Frequency = {angular_frequency}"])
         + ([f'Output File = "{output_file}"', "Binary Output = True", "Output Intervals(1) = 1"] if output_file else [])
         + ([f'Restart File = "{restart_file}"'] if restart_file else [])
-        + ([f"Restart Position = {restart_position}"] if restart_position is not None else []),
+        + ([f"Restart Position = {restart_position}"] if restart_position is not None else [])
+        + (additional_simulation_lines if additional_simulation_lines is not None else []),
     )
     return res
 
@@ -166,22 +168,25 @@ def is_direct_method(linsys_method: str) -> bool:
     return linsys_method in ["umfpack", "pardiso", "superlu"] or linsys_method.endswith("mumps")
 
 
-def sif_linsys(json_data: dict) -> list[str]:
+def sif_linsys(json_data: dict, define_element=True) -> list[str]:
     """
     Returns a linear system definition in sif format.
 
     Args:
         json_data: all the model data produced by `export_elmer_json`
             See kqcircuits/simulations/export/elmer/elmer_solution.py for docstring of the parameters used from the json
+        define_element: define element as described in `json_data`
 
     Returns:
         linear system definitions in sif file format
     """
-    linsys = [
-        f"$pn={json_data['p_element_order']}",
-        "Element = p:$pn",
-        "Vector Assembly = True",
-    ]
+    linsys = []
+    if define_element:
+        linsys += [
+            f"$pn={json_data['p_element_order']}",
+            "Element = p:$pn",
+            "Vector Assembly = True",
+        ]
     linsys_method = json_data["linear_system_method"].lower()
     preconditioner = json_data["linear_system_preconditioning"]
 
@@ -532,6 +537,55 @@ def get_electrostatics_solver(
     return sif_block(f"Solver {ordinate}", solver_lines)
 
 
+def get_save_data_eigen(ordinate: str | int):
+    solver_lines = [
+        'Exec Solver = "After Saving"',
+        'Equation = "save scalars"',
+        'Procedure = "SaveData" "SaveScalars"',
+        "Save Eigenfrequencies = Logical True",
+        "Filename = f.dat",
+        "Show Norm Index = 1",
+    ]
+    return sif_block(f"Solver {ordinate}", solver_lines)
+
+
+def get_eigenmode_solver(
+    n_modes: int,
+    min_frequency: float,
+    json_data: dict[str, Any],
+    ordinate: str | int,
+    exec_solver: str = "Always",
+) -> str:
+    """
+    Returns eigen solver in sif file format.
+
+    Args:
+        n_modes: Number of eigenmodes to solve.
+        json_data: all the model data produced by `export_elmer_json`
+            See kqcircuits/simulations/export/elmer/elmer_solution.py for docstring of the parameters used from the json
+        ordinate: solver ordinate
+
+    Returns:
+        eigen solver in sif file format
+    """
+    solver_lines = [
+        f"Exec Solver = {exec_solver}",
+        'Equation = "Vector Wave"',
+        'Procedure = "EMWaveSolver" "EMWaveSolver"',
+        "Variable = E",
+        "Use Global Mass Matrix = True",
+        "Eigen Analysis = True",
+        f"Eigen System Values = {n_modes}",
+        "Eigen System Convergence Tolerance = 0",
+        "Eigen System Select = smallest real part",
+        f"Quadratic Approximation = Logical {json_data['quadratic_approximation']}",
+        f"Eigen System Shift = Real {(2*np.pi*min_frequency)**2}",
+    ]
+    solver_lines += sif_linsys(json_data, define_element=False)
+
+    return sif_block(f"Solver {ordinate}", solver_lines)
+
+
 def get_circuit_solver(ordinate: str | int, p_element_order: int, exec_solver="Always") -> str:
     """
     Returns circuit solver in sif file format.
@@ -654,6 +708,33 @@ def get_magneto_dynamics_calc_fields(ordinate: str | int, p_element_order: int) 
     return sif_block(f"Solver {ordinate}", solver_lines)
 
 
+def get_eigenmode_calc_fields(ordinate: str | int) -> str:
+    """
+    Returns eigenmode post processor solver in sif file format.
+
+    Args:
+        ordinate: solver ordinate
+
+    Returns:
+        eigenmode post processor solver in sif file format.
+    """
+    solver_lines = [
+        'Equation = "calcfields"',
+        'Procedure = "EMWaveSolver" "EMWaveCalcFields"',
+        "Linear System Symmetric = False",
+        "Calculate Elemental Fields = True",
+        "Calculate Nodal Fields = False",
+        "Steady State Convergence Tolerance = 1",
+        "Linear System Solver = iterative",
+        "Linear System Preconditioning = Diagonal",
+        "Linear System Max Iterations = 1000",
+        "Linear System Iterative Method = CG",
+        "Linear System Convergence Tolerance = 1.0e-9",
+        "Calculate Electric field derivatives = Logical True",
+    ]
+    return sif_block(f"Solver {ordinate}", solver_lines)
+
+
 def get_result_output_solver(ordinate: str | int, output_file_name: str | Path, exec_solver: str = "Always") -> str:
     """
     Returns result output solver in sif file format.
@@ -675,6 +756,35 @@ def get_result_output_solver(ordinate: str | int, output_file_name: str | Path, 
         "Discontinuous Bodies = Logical True",
         "!Save All Meshes = Logical True",
         "Save Geometry Ids = Logical True",
+    ]
+
+    return sif_block(f"Solver {ordinate}", solver_lines)
+
+
+def get_result_output_eigen_solver(
+    ordinate: str | int, output_file_name: str | Path, exec_solver: str = "Always"
+) -> str:
+    """
+    Returns result output solver in sif file format.
+
+    Args:
+        ordinate: solver ordinate
+        output_file_name: output file name
+        exec_solver: Execute solver (options: 'Always', 'After Timestep', 'Never')
+
+    Returns:
+        result ouput solver in sif file format
+    """
+    solver_lines = [
+        f"Exec Solver = {exec_solver}",
+        'Equation = "ResultOutput"',
+        'Procedure = "ResultOutputSolve" "ResultOutputSolver"',
+        f'Output File Name = "{output_file_name}"',
+        "Vtu format = Logical True",
+        "Ascii Output = Logical True",
+        "Save Geometry Ids = Logical True",
+        "Eigen Analysis = True",
+        'Eigen Vector Component = String "complex"',
     ]
 
     return sif_block(f"Solver {ordinate}", solver_lines)
@@ -878,6 +988,8 @@ def produce_sif_files(json_data: dict[str, Any], path: Path) -> list[Path]:
     for ind, sif in enumerate(sif_names):
         if tool == "capacitance":
             content = sif_capacitance(json_data, path, vtu_name=path, angular_frequency=0, dim=3, with_zero=False)
+        elif tool == "eigenmode":
+            content = sif_eigenmode(json_data, path, vtu_name=path, dim=3, with_zero=False)
         elif tool == "epr_3d":
             content = sif_epr_3d(json_data, path, vtu_name=path)
         elif tool == "wave_equation":
@@ -952,6 +1064,39 @@ def sif_placeholder_boundaries(groups: list[str], n_boundaries: int) -> str:
     return boundary_conditions
 
 
+def get_simulation_restart_solver(ordinate: str | int, parent_name: str, path: Path) -> str:
+    """
+    Returns solver for loading existing Elmer results from a .result file exported by setting
+    `save_elmer_results=True`. Does not solve anything, but allocates required data structures.
+
+    Assumes the field variable to be "Potential" and renames it to "ParentPotential".
+
+    Args:
+        ordinate: solver ordinate
+        parent_name: Name of the simulation to be loaded
+        path: simulation folder path
+
+    Returns:
+        solver in sif file format
+    """
+    with open(path / f"{parent_name}.json", encoding="utf-8") as f:
+        json_data = json.load(f)
+    mesh_name = json_data["mesh_name"]
+
+    solver_lines = [
+        'Equation = "CoarseRestart"',
+        'Procedure = "AllocateSolver" "AllocateSolver"',
+        "Exec Solver = never",
+        f'Mesh = "{mesh_name}"',
+        f'Restart File = File "../{mesh_name}/{parent_name}.result"',
+        "Restart Variable 1 = String Potential",
+        "Target Variable 1 = String ParentPotential",
+        "Restart Error Continue = Logical True",
+    ]
+
+    return sif_block(f"Solver {ordinate}", solver_lines)
+
+
 def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Path) -> str:
     """
     Returns 3D EPR simulation sif
@@ -973,6 +1118,16 @@ def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Pat
     c_matrix_output = not bool(voltage_exc)
     mesh_path = Path(json_data["mesh_name"])
 
+    submodel_restart_lines = None
+    parent_name = json_data["parent_name"]
+    if parent_name:
+        submodel_restart_lines = [
+            "Initialize Dirichlet Conditions = False",
+            "Restart Before Initial Conditions = Logical True",
+            "Restart Error Continue = Logical True",
+            "Use Mesh Projector = Logical False",
+        ]
+
     header = sif_common_header(
         json_data,
         folder_path,
@@ -981,7 +1136,9 @@ def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Pat
         dim=3,
         constraint_modes_analysis=c_matrix_output,
         output_file=(f"{folder_path}.result" if json_data["save_elmer_data"] else None),
+        additional_simulation_lines=submodel_restart_lines,
     )
+
     constants = sif_block("Constants", [f"Permittivity Of Vacuum = {epsilon_0}"])
 
     solvers = get_electrostatics_solver(
@@ -994,10 +1151,6 @@ def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Pat
         ordinate=2,
         output_file_name=vtu_name,
         exec_solver="Always" if json_data["vtu_output"] else "Never",
-    )
-    equations = get_equation(
-        ordinate=1,
-        solver_ids=[1],
     )
 
     body_names, boundary_names = read_mesh_names(mesh_path)
@@ -1021,6 +1174,17 @@ def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Pat
         energy_file="energy.dat",
         bodies=mesh_bodies,
         sheet_bodies=mesh_boundaries,
+    )
+
+    if parent_name:
+        solvers += get_simulation_restart_solver(5, parent_name, folder_path.parent)
+        equations_ids = [5, 1]
+    else:
+        equations_ids = [1]
+
+    equations = get_equation(
+        ordinate=1,
+        solver_ids=equations_ids,
     )
 
     bodies = ""
@@ -1067,12 +1231,15 @@ def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Pat
     boundary_conditions = ""
     n_bcs = 1
 
+    if parent_name:
+        outer_condition = ["Potential = Equals ParentPotential"]
+    elif json_data.get("electric_infinity_bc", False):
+        outer_condition = ["Electric Infinity BC = Logical True"]
+    else:
+        outer_condition = ["! Placeholder"]
+
     boundary_conditions += sif_boundary_condition(
-        ordinate=n_bcs,
-        target_boundaries=["domain_boundary"],
-        conditions=[
-            "Electric Infinity BC = Logical True" if json_data.get("electric_infinity_bc", False) else "! Placeholder"
-        ],
+        ordinate=n_bcs, target_boundaries=["domain_boundary"], conditions=outer_condition
     )
 
     # tls bcs
@@ -1085,6 +1252,99 @@ def sif_epr_3d(json_data: dict[str, Any], folder_path: Path, vtu_name: str | Pat
         )
 
     return header + constants + solvers + equations + materials + bodies + body_forces + boundary_conditions
+
+
+def sif_eigenmode(
+    json_data: dict[str, Any],
+    folder_path: Path,
+    vtu_name: str | Path,
+    dim: int,
+    with_zero: bool,
+) -> str:
+    """
+    Returns the eigenmode solver sif. If `with_zero` is true then all the permittivities are set to 1.0.
+
+    Args:
+        json_data: all the model data produced by `export_elmer_json`
+            See kqcircuits/simulations/export/elmer/elmer_solution.py for docstring of the parameters used from the json
+        folder_path: folder path of the model files
+        vtu_name: name of the paraview file
+        dim: model dimensionality (2 or 3)
+        with_zero: without dielectrics if true
+
+    Returns:
+        elmer solver input file for eigenmode computation
+    """
+
+    mesh_path = Path(json_data["mesh_name"])
+
+    voltage_exc = json_data.get("voltage_excitations", None)
+
+    header = sif_common_header(
+        json_data,
+        folder_path,
+        mesh_path,
+        angular_frequency=0,
+        dim=dim,
+        constraint_modes_analysis=False,
+        output_file=(f"{folder_path}.result" if json_data["save_elmer_data"] else None),
+    )
+
+    constants = sif_block("Constants", [f"Permittivity Of Vacuum = {epsilon_0}", f"Permeability Of Vacuum = {mu_0}"])
+
+    solvers = get_eigenmode_solver(
+        json_data["n_modes"], json_data["min_frequency"] * 1e9, json_data, ordinate=1  # convert from GHz
+    )
+    solvers += get_eigenmode_calc_fields(ordinate=2)
+    solvers += get_save_data_eigen(ordinate=3)
+    solvers += get_result_output_eigen_solver(
+        ordinate=4,
+        output_file_name=vtu_name,
+        exec_solver="After saving" if json_data["vtu_output"] else "Never",
+    )
+
+    equations = get_equation(
+        ordinate=1,
+        solver_ids=[1, 2],
+    )
+
+    body_names, boundary_names = read_mesh_names(mesh_path)
+    body_list = get_layer_list(json_data, body_names)
+    permittivity_list = get_permittivities(json_data, with_zero, body_list)
+
+    bodies = ""
+    materials = ""
+    for i, (body, perm) in enumerate(zip(body_list, permittivity_list), 1):
+        bodies += sif_body(
+            ordinate=i, target_bodies=[body], equation=1, material=i, keywords=[f"{body} = Logical True"]
+        )
+
+        materials += sif_block(f"Material {i}", [f"Relative Permittivity = {perm}", "Relative Permeability = 1"])
+
+    # Boundary conditions
+    boundary_conditions = ""
+    n_boundaries = 0
+    excitation_names = [n for n in boundary_names if n.startswith("excitation_") and n.endswith("_boundary")]
+    excitations = sorted([(int(n[11:-9]), n) for n in excitation_names])
+    for excitation, excitation_name in excitations:
+        if excitation == 0:  # ground
+            condition = "E {e} = Real 0"
+        elif voltage_exc:  # signal with specified voltage
+            condition = "E {e} = Real 0"
+        else:  # signal for capacitance simulation
+            condition = "E {e} = Real 0"
+
+        n_boundaries += 1
+        boundary_conditions += sif_boundary_condition(n_boundaries, [excitation_name], [condition])
+
+    n_boundaries += 1
+    boundary_conditions += sif_boundary_condition(
+        ordinate=n_boundaries,
+        target_boundaries=["domain_boundary"],
+        conditions=["E {e} = Real 0"],
+    )
+
+    return header + constants + solvers + equations + materials + bodies + boundary_conditions
 
 
 def sif_capacitance(
@@ -1927,9 +2187,23 @@ def read_snp_file(filename: str | Path) -> tuple[np.ndarray, np.ndarray, bool, f
     return frequencies, smatrix_arr, polar_form, renormalization, port_data
 
 
+def delete_meshes(path, simname):
+    """Deletes Elmer and Gmsh meshes corresponding to simname"""
+    sif_folder = path / simname
+    (path / f"{simname}.msh").unlink(missing_ok=True)
+    elmer_mesh_files = ["mesh.nodes", "mesh.elements", "mesh.boundary"]
+    for ef in elmer_mesh_files:
+        (sif_folder / ef).unlink(missing_ok=True)
+    for part_folder in sif_folder.glob("partitioning.*"):
+        if part_folder.is_dir():
+            shutil.rmtree(part_folder)
+
+
 def write_project_results_json(json_data: dict[str, Any], path: Path, polar_form: bool = True) -> None:
     """
     Writes the solution data in '_project_results.json' format for one Elmer simulation.
+
+    Deletes Gmsh and Elmer mesh files if json_data["workflow"]["delete_meshes"] is True
 
     If tool is capacitance, writes capacitance matrix
     If tool is epr_3d or capacitance with integrate energies=True, writes energies
@@ -1944,6 +2218,8 @@ def write_project_results_json(json_data: dict[str, Any], path: Path, polar_form
     simname = json_data["name"]
     sif_folder = path / simname
     result_json_path = path / (simname + "_project_results.json")
+    if json_data["workflow"]["delete_meshes"]:
+        delete_meshes(path, simname)
 
     if tool in ("capacitance", "epr_3d"):
         results = {}

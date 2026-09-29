@@ -17,14 +17,13 @@
 # and organizations (meetiqm.com/iqm-organization-contributor-license-agreement).
 
 
-import importlib
-import importlib.util
 from inspect import isclass
 
 from kqcircuits.defaults import default_layers, default_faces
-from kqcircuits.pya_resolver import pya
+from kqcircuits.pya_resolver import pya, lay, is_standalone_session
 from kqcircuits.simulations.epr.gui_config import epr_gui_visualised_partition_regions
 from kqcircuits.util.geometry_helper import get_cell_path_length
+from kqcircuits.util.gui_epr_preview import draw_epr_markers
 from kqcircuits.util.library_helper import load_libraries, to_library_name, to_module_name
 from kqcircuits.util.parameters import Param, pdt
 from kqcircuits.util.refpoints import Refpoints
@@ -150,12 +149,24 @@ class Element(pya.PCellDeclarationHelper):
     opposing_face_id_groups = Param(
         pdt.TypeList, "Opposing face ID groups (list of lists)", [["1t1", "2b1"]], hidden=True
     )
+    duplicate_face_ids = Param(
+        pdt.TypeList,
+        "Duplicate face IDs (list of lists), where the first face of each group is copied into other faces",
+        [],
+        hidden=True,
+    )
+    duplicate_layers = Param(
+        pdt.TypeList,
+        "Layers (list), which are copied into other faces when duplicate_face_ids are given",
+        ["base_metal_gap", "base_metal_gap_wo_grid", "base_metal_addition"],
+        hidden=True,
+    )
     etch_opposite_face = Param(pdt.TypeBoolean, "Etch avoidance shaped gap on the opposite face too", False)
     etch_opposite_face_margin = Param(pdt.TypeDouble, "Margin of the opposite face etch shape", 5, unit="μm")
 
     _epr_show = Param(pdt.TypeBoolean, "Show geometry related to EPR simulation, if available", False)
-    _epr_cross_section_cut_layer = Param(pdt.TypeLayer, "Layer where EPR cross section cuts are placed", None)
-    _epr_cross_section_cut_width = Param(pdt.TypeDouble, "Width of the EPR cross section cuts when visualised", 0.0)
+    _epr_cross_section_cut = Param(pdt.TypeBoolean, "Show EPR cross section cuts, if available", False)
+    _epr_counter = Param(pdt.TypeInt, "Internal counter to enable EPR preview", 0, hidden=True)
 
     def __init__(self):
         """"""
@@ -204,13 +215,13 @@ class Element(pya.PCellDeclarationHelper):
         # Now add the new parameters
         if to_library_name(cls.__name__) in epr_gui_visualised_partition_regions:
             for pr in epr_gui_visualised_partition_regions[to_library_name(cls.__name__)]:
-                pr_name = f"{epr_part_reg_prefix}{pr}_layer"
+                pr_name = f"{epr_part_reg_prefix}{pr}"
                 self._param_value_map[pr_name] = len(self._param_decls)
-                pr_desc = f"Layer where EPR partition region '{pr}' is placed"
-                param = Param(pdt.TypeLayer, pr_desc, None)
+                pr_desc = f"Show EPR partition region '{pr}'"
+                param = Param(pdt.TypeBoolean, pr_desc, False)
                 param.__set_name__(cls, pr_name)
                 setattr(type(self), pr_name, param)
-                self._add_parameter(pr_name, pdt.TypeLayer, pr_desc, default=None)
+                self._add_parameter(pr_name, pdt.TypeBoolean, pr_desc, default=False)
 
     @staticmethod
     def create_cell_from_shape(layout, name):
@@ -402,7 +413,7 @@ class Element(pya.PCellDeclarationHelper):
             new_name: Optionally rename the port
         """
         copy_name = name if new_name is None else new_name
-        port_name = "port" if name == "" else f"port_{name}"
+        port_name = name if "port" in name else ("port_" + name if name else "port")
         port_corner_name = f"{port_name}_corner"
 
         # workaround for getting the cell due to KLayout bug, see
@@ -460,6 +471,17 @@ class Element(pya.PCellDeclarationHelper):
             text = pya.DText(name, refpoint.x, refpoint.y)
             self.cell.shapes(self.get_layer("refpoints")).insert(text)
 
+    def coerce_parameters_impl(self):
+        """Increments _epr_counter to force geometry regeneration on every parameter change.
+
+        KLayout caches PCell geometry and skips produce_impl/post_build call on cache hit,
+        returning cached layout instead. By incrementing _epr_counter on every coerce parameters call while
+        _epr_show is active, we ensure KLayout always sees a novel parameter set and unconditionally
+        rebuilds geometry — so post_build always runs and EPR preview markers are redrawn.
+        """
+        if not is_standalone_session() and self._epr_show:
+            self._epr_counter += 1
+
     def etch_opposite_face_impl(self):
         """Implements the shape of the opposite face,
         which is etched out if ``etch_opposite_face`` is enabled.
@@ -480,14 +502,40 @@ class Element(pya.PCellDeclarationHelper):
                             self.cell.shapes(self.get_layer("base_metal_gap_wo_grid", other_face)).insert(etch_shape)
                             self.cell.shapes(self.get_layer("ground_grid_avoidance", other_face)).insert(protection)
 
+    def duplicate_face_impl(self):
+        """Duplicates the shapes from one face to others, if the ``duplicate_face_ids`` is enabled."""
+        for faces in self.duplicate_face_ids:
+            if len(faces) < 2:
+                continue
+            if not isinstance(faces, list):
+                raise ValueError("faces have to be given as list of lists.")
+            source_shapes = {
+                n: self.cell.shapes(self.layout.layer(i))
+                for n, i in self.face(faces[0]).items()
+                if not self.cell.shapes(self.layout.layer(i)).is_empty()
+            }
+            for other_face in faces[1:]:
+                for name, info in self.face(other_face).items():
+                    if name in self.duplicate_layers:
+                        target_shapes = self.cell.shapes(self.layout.layer(info))
+                        if name in source_shapes:
+                            target_shapes.assign(source_shapes[name].dup())
+                        else:
+                            target_shapes.clear()
+
     def build(self):
         """Child classes re-define this method to build the PCell."""
 
     def post_build(self):
         """Child classes may re-define this method for post-build operations."""
         self.etch_opposite_face_impl()
-        self._show_epr_cross_section_cuts()
-        self._show_epr_partition_regions()
+        self.duplicate_face_impl()
+        if not is_standalone_session():
+            layout_view = lay.LayoutView.current()
+            if layout_view is not None:
+                layout_view.clear_markers()
+                if self._epr_show:
+                    draw_epr_markers(self, layout_view)
 
     def display_text_impl(self):
         if self.display_name:
@@ -635,59 +683,3 @@ class Element(pya.PCellDeclarationHelper):
             List of RefpointToSimPort objects, empty list by default
         """
         return []
-
-    def _show_epr_cross_section_cuts(self):
-        if not self._epr_show or self._epr_cross_section_cut_layer is None:
-            return
-        if self._epr_cross_section_cut_layer.layer < 0:
-            return
-        library_name = self.__module__.split(".", maxsplit=1)[0]
-        element_name = self.__module__.rsplit(".", maxsplit=1)[-1]
-        epr_module_path = f"{library_name}.simulations.epr.{element_name}"
-        if not importlib.util.find_spec(epr_module_path):
-            return
-        epr_layer = self.layout.layer(self._epr_cross_section_cut_layer)
-        epr_module = importlib.import_module(epr_module_path)
-        importlib.reload(epr_module)
-        assert hasattr(epr_module, "correction_cuts"), f"No 'correction_cuts' function defined in {epr_module_path}"
-        cuts = epr_module.correction_cuts(self)
-        for cut_name, cut in cuts.items():
-            cut_path = pya.DPath([cut["p1"], cut["p2"]], self._epr_cross_section_cut_width).to_itype(self.layout.dbu)
-            # Prevent .OAS saving errors by rounding integer value of path width to even value
-            cut_path.width -= cut_path.width % 2
-            cut_region = pya.Region(cut_path)
-            self.cell.shapes(epr_layer).insert(cut_region)
-            self.cell.shapes(epr_layer).insert(pya.DText(f"{cut_name}_1", cut["p1"].x, cut["p1"].y))
-            self.cell.shapes(epr_layer).insert(pya.DText(f"{cut_name}_2", cut["p2"].x, cut["p2"].y))
-
-    def _show_epr_partition_regions(self):
-        if not self._epr_show:
-            return
-        library_name = self.__module__.split(".", maxsplit=1)[0]
-        element_name = self.__module__.rsplit(".", maxsplit=1)[-1]
-        epr_module_path = f"{library_name}.simulations.epr.{element_name}"
-        if not importlib.util.find_spec(epr_module_path):
-            return
-        epr_module = importlib.import_module(epr_module_path)
-        importlib.reload(epr_module)
-        assert hasattr(epr_module, "partition_regions"), f"No 'partition_regions' function defined in {epr_module_path}"
-        for pr in epr_module.partition_regions(self):
-            if not hasattr(self, f"_epr_part_reg_{pr.name}_layer"):
-                continue
-            epr_layer_info = getattr(self, f"_epr_part_reg_{pr.name}_layer")
-            if not epr_layer_info:
-                continue
-            if epr_layer_info.layer < 0:
-                continue
-            epr_layer = self.layout.layer(self._param_values[self._param_value_map[f"_epr_part_reg_{pr.name}_layer"]])
-            region = pya.Region()
-            if isinstance(pr.region, list):
-                for r in pr.region:
-                    region += pya.Region(r.to_itype(self.layout.dbu))
-            elif isinstance(pr.region, pya.Region):
-                region = pr.region
-            else:
-                region = pya.Region(pr.region.to_itype(self.layout.dbu))
-            self.cell.shapes(epr_layer).insert(region)
-            center_point = region.bbox().to_dtype(self.layout.dbu).center()
-            self.cell.shapes(epr_layer).insert(pya.DText(pr.name, center_point.x, center_point.y))

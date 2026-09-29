@@ -19,7 +19,7 @@
 
 import abc
 import ast
-
+from math import inf
 import logging
 
 from kqcircuits.defaults import default_faces
@@ -267,6 +267,7 @@ class Simulation:
     small_shape_area = Param(pdt.TypeDouble, "Area below which shapes will trigger a warning.", 1.0, unit="µm²")
 
     base_metal_addition_layers = Param(pdt.TypeList, "Layers to be added to base metal", ["base_metal_addition"])
+    parent_simulation = Param(pdt.TypeNone, "Instance of Simulation subclass to determine excitations", None)
 
     extra_json_data = Param(
         pdt.TypeNone,
@@ -275,7 +276,7 @@ class Simulation:
         docstring="This field may be used to store 'virtual' parameters useful for your simulations",
     )
 
-    def __init__(self, layout, **kwargs):
+    def __init__(self, layout, ports=None, **kwargs):
         """Initialize a Simulation.
 
         The initializer parses parameters, creates a top cell, and then calls `self.build` to create
@@ -284,6 +285,11 @@ class Simulation:
 
         Args:
             layout: the layout on which to create the simulation
+            ports: optional list of `Port` to assign to the simulation. This is meant for simulations
+                created with an existing cell where `build` does not add ports itself, such as
+                `Simulation.from_cell`. When given, the list replaces `self.ports` after `build` has
+                run and before the simulation layers are created. Leave as None for subclasses that
+                populate `self.ports` inside `build`.
 
         Keyword arguments:
             `**kwargs`:
@@ -325,11 +331,13 @@ class Simulation:
 
         self.layers = {}
         self.build()
+        if ports is not None:
+            self.ports = ports
         self.create_simulation_layers()
         self.warn_of_small_shapes()
 
     @classmethod
-    def from_cell(cls, cell, margin=300, grid_size=1, **kwargs):
+    def from_cell(cls, cell, margin=300, grid_size=1, ports=None, **kwargs):
         """Create a Simulation from an existing cell.
 
         Arguments:
@@ -338,6 +346,8 @@ class Simulation:
                 box of the cell If the `box` keyword argument is given, margin is ignored.
             grid_size: size of the simulation box will be rounded to this resolution
                 If the `box` keyword argument is given, grid_size is ignored.
+            ports: optional list of `Port` to assign to the simulation. Pass this when the ports are
+                determined from the existing geometry, since the default `build` does not add ports.
             `**kwargs`: any simulation parameters passed
 
         Returns:
@@ -354,7 +364,7 @@ class Simulation:
                 box.top = round(box.top / grid_size) * grid_size
             extra_kwargs["box"] = box
 
-        return cls(cell.layout(), cell=cell, **kwargs, **extra_kwargs)
+        return cls(cell.layout(), cell=cell, ports=ports, **kwargs, **extra_kwargs)
 
     @abc.abstractmethod
     def build(self):
@@ -631,42 +641,65 @@ class Simulation:
         parts = [p for p in parts if p]
 
         # assign excitation to parts
-        ports = sorted(self.ports, key=lambda p: p.number) if self.use_ports else []
-        excitations = [{}]
-        z = self.face_z_levels()
-        for port in ports:
-            signal_z = round(z[resolve_face(port.face, self.face_ids)][0], 12)
-            if hasattr(port, "ground_location"):
-                v_mps = port.signal_location - port.ground_location
-                v_mps = self.minimum_point_spacing * v_mps / v_mps.abs()
-                signal_loc = (port.signal_location + v_mps).to_itype(self.layout.dbu)
-                if not port.floating:
-                    ground_loc = (port.ground_location - v_mps).to_itype(self.layout.dbu)
-                    merge_parts(get_connected_part(ground_loc, signal_z), excitations[0])  # ground excitation
-            else:
-                signal_loc = port.signal_location.to_itype(self.layout.dbu)
+        if self.parent_simulation is not None:
+            # assign excitation based on parent_simulation
+            excitation_dict = {}
+            for layer_name, parent_layer in self.parent_simulation.layers.items():
+                if "excitation" not in parent_layer:
+                    continue
+                excitation = parent_layer["excitation"]
+                if excitation not in excitation_dict:
+                    excitation_dict[excitation] = {}
+                bottom, top = parent_layer["z"], parent_layer["z"] + parent_layer["thickness"]
+                sim_layer = get_simulation_layer_by_name(layer_name)
+                region = pya.Region(self.parent_simulation.cell.shapes(self.parent_simulation.layout.layer(sim_layer)))
+                for p in parts:
+                    for n, r in p.items():
+                        layer = self.layers[n]
+                        if layer["top"] >= bottom and layer["bottom"] <= top and not r.interacting(region).is_empty():
+                            merge_parts(p, excitation_dict[excitation])
+                            break
+            excitations = [excitation_dict.get(i, {}) for i in range(max(excitation_dict.keys()) + 1)]
+        else:
+            # assign excitation based on ports
+            ports = sorted(self.ports, key=lambda p: p.number) if self.use_ports else []
+            excitations = [{}]
+            z = self.face_z_levels()
+            for port in ports:
+                signal_z = round(z[resolve_face(port.face, self.face_ids)][0], 12)
+                if hasattr(port, "ground_location"):
+                    v_mps = port.signal_location - port.ground_location
+                    v_mps = self.minimum_point_spacing * v_mps / v_mps.abs()
+                    signal_loc = (port.signal_location + v_mps).to_itype(self.layout.dbu)
+                    if not port.floating:
+                        ground_loc = (port.ground_location - v_mps).to_itype(self.layout.dbu)
+                        merge_parts(get_connected_part(ground_loc, signal_z), excitations[0])  # ground excitation
+                else:
+                    signal_loc = port.signal_location.to_itype(self.layout.dbu)
 
-            # append port excitation to excitations if it exists
-            port_excitation = {}
-            merge_parts(get_connected_part(signal_loc, signal_z), port_excitation)
-            if port_excitation:
-                excitations.append(port_excitation)
+                # append port excitation to excitations if it exists
+                port_excitation = {}
+                merge_parts(get_connected_part(signal_loc, signal_z), port_excitation)
+                if port_excitation:
+                    excitations.append(port_excitation)
 
-        # assign remaining parts as ground if they touch edge, bottom, or top of the simulation box, otherwise floating
-        ground_edges = pya.Region(self.box.to_itype(self.layout.dbu)).edges()
+            # assign remaining parts as ground if they touch edge, bottom, or top of the simulation box
+            ground_edges = pya.Region(self.box.to_itype(self.layout.dbu)).edges()
+            for part in parts:
+                if any(
+                    self.layers[n]["bottom"] <= round(z[0], 12)
+                    or round(z[-1], 12) <= self.layers[n]["top"]
+                    or not r.interacting(ground_edges).is_empty()
+                    for n, r in part.items()
+                ):
+                    merge_parts(part, excitations[0])  # ground excitation
+
+        # assign remaining parts as floating
         for part in parts:
-            if any(
-                self.layers[n]["bottom"] <= round(z[0], 12)
-                or round(z[-1], 12) <= self.layers[n]["top"]
-                or not r.interacting(ground_edges).is_empty()
-                for n, r in part.items()
-            ):
-                merge_parts(part, excitations[0])  # ground excitation
-            else:
-                floating_excitation = {}
-                merge_parts(part, floating_excitation)
-                if floating_excitation:
-                    excitations.append(floating_excitation)
+            floating_excitation = {}
+            merge_parts(part, floating_excitation)
+            if floating_excitation:
+                excitations.append(floating_excitation)
 
         # split metals by excitations
         for name in metal_names:
@@ -933,7 +966,7 @@ class Simulation:
                     return True
             elif obj["top"] <= tool["bottom"] or tool["top"] <= obj["bottom"]:
                 return True
-            return tool["region"].overlapping(obj["region"]).is_empty()
+            return tool["region"].overlapping(obj["region"].sized(-1)).is_empty()
 
         def subtract(obj, lay):
             """Subtracts layers[lay] from obj."""
@@ -948,55 +981,71 @@ class Simulation:
                 return  # ignore separate objects
             obj["subtract"] = obj.get("subtract", set()) | {lay}
 
-        def subtract_hard(obj, tool):
-            """Subtracts tool from obj by modifying dimensions of obj. Returns True if successful."""
-            if are_separate(obj, tool):
-                return True
-            subtract_diff = tool.get("subtract", set()) - obj["subtract"]
-            if any(layers[s].get("material", None) is None and not are_separate(obj, layers[s]) for s in subtract_diff):
-                return False  # can't apply hard subtract if tool has non-material subtractions that obj doesn't have
-            if obj["bottom"] < tool["bottom"]:
-                if tool["top"] < obj["top"]:
-                    return False
-                if obj["region"].not_inside(tool["region"]).is_empty() or not exists(
-                    {
-                        "bottom": tool["bottom"],
-                        "top": obj["top"],
-                        "region": obj["region"].dup(),
-                        "subtract": obj["subtract"].copy(),
-                    }
-                ):
-                    obj["top"] = tool["bottom"]
-                    return True
-                return False
-            if tool["top"] < obj["top"]:
-                if obj["region"].not_inside(tool["region"]).is_empty() or not exists(
-                    {
-                        "bottom": obj["bottom"],
-                        "top": tool["top"],
-                        "region": obj["region"].dup(),
-                        "subtract": obj["subtract"].copy(),
-                    }
-                ):
-                    obj["bottom"] = tool["top"]
-                    return True
-                return False
-            if not can_modify(tool) and tool["region"].inside(obj["region"]).count() > 10 * obj["region"].count():
-                return False  # avoid lateral hard subtract if it creates lots of holes (useful with lots of vias)
-            obj["region"] -= tool["region"]
-            return True
+        def subtract_avoid_hole_grid(obj_region, tool_region):
+            """Subtracts the tool region from the object region unless the subtraction creates lots of holes. Avoiding
+            subtraction with plenty of holes is important for the performance for example in case of lots of vias.
+            """
+            if tool_region.inside(obj_region).count() <= 10 * obj_region.count():
+                obj_region -= tool_region
+
+        def sub_layers(obj, bottom=-inf, top=inf):
+            """Returns object divided into sub-layers such that the subtractions in obj['subtract'] are applied.
+            The return format for sub-layers is a list of tuples containing bottom height, top height, and region.
+            Only non-empty regions are returned.
+            """
+            # Determine z-intersection between given bottom and top and the object
+            bottom, top = max(bottom, obj["bottom"]), min(top, obj["top"])
+            if bottom > top:
+                return []
+
+            # Get sub-layer divisions for all subtracted objects
+            subtracts_layers = [sub_layers(layers[s], bottom, top) for s in obj.get("subtract", set())]
+
+            # Special case for sheet object
+            if obj["bottom"] == obj["top"]:
+                z = obj["bottom"]
+                below_region = obj["region"].dup()
+                above_region = obj["region"].dup()
+                for subtract_layers in subtracts_layers:
+                    for b, t, r in subtract_layers:
+                        if b == z == t or b <= z < t:
+                            subtract_avoid_hole_grid(above_region, r)
+                        if b == z == t or b < z <= t:
+                            subtract_avoid_hole_grid(below_region, r)
+                region = below_region + above_region
+                return [] if region.sized(-1).is_empty() else [(z, z, region)]
+
+            # For solid objects only, define z-intervals for the sub-layers
+            subtract_zs = {z for subtract_layers in subtracts_layers for b, t, _ in subtract_layers for z in (b, t)}
+            if bottom == top:  # if sheet projection is requested, defines z-intervals above and below
+                bottom = max([obj["bottom"]] + [z for z in subtract_zs if z < bottom])
+                top = min([obj["top"]] + [z for z in subtract_zs if top < z])
+            zs = sorted({bottom, top} | {z for z in subtract_zs if bottom < z < top})
+
+            # Return sub-layers for determined z-intervals
+            _layers = []
+            for _bottom, _top in zip(zs[:-1], zs[1:]):
+                region = obj["region"].dup()
+                for subtract_layers in subtracts_layers:
+                    for b, t, r in subtract_layers:
+                        if b <= _bottom and _top <= t:
+                            subtract_avoid_hole_grid(region, r)
+                if not region.sized(-1).is_empty():
+                    _layers.append((_bottom, _top, region))
+            return _layers
 
         def exists(obj):
             """Hardens subtractions and returns True if geometry exists."""
             if "subtract" in obj:
-                while True:
-                    for s in obj["subtract"]:
-                        if subtract_hard(obj, layers[s]):
-                            obj["subtract"].remove(s)
-                            break
-                    else:
-                        break
-
+                _layers = sub_layers(obj)
+                obj["region"] = pya.Region()
+                if _layers:
+                    obj["bottom"] = _layers[0][0]
+                    obj["top"] = _layers[-1][1]
+                    for _, _, r in _layers:
+                        obj["region"] += r
+                    obj["region"].merge()
+                    obj["subtract"] = {s for s in obj["subtract"] if not are_separate(obj, layers[s])}
             return not obj["region"].is_empty()
 
         def covering_regions(obj, tool):
@@ -1255,8 +1304,10 @@ class Simulation:
 
     def get_parameters(self):
         """Return dictionary with all parameters and their values."""
-
-        return {param: getattr(self, param) for param in type(self).get_schema()}
+        params = {param: getattr(self, param) for param in type(self).get_schema()}
+        if "parent_simulation" in params:
+            params["parent_simulation"] = self.parent_simulation.name if self.parent_simulation is not None else ""
+        return params
 
     def etched_line(self, p1: pya.DPoint, p2: pya.DPoint):
         """
@@ -1420,6 +1471,7 @@ class Simulation:
         """
         return {
             "simulation_name": self.name,
+            "parent_simulation": self.parent_simulation.name if self.parent_simulation is not None else "",
             "units": "um",  # hardcoded assumption in multiple places
             "layers": self.layers,
             "material_dict": self.check_material_dict(),

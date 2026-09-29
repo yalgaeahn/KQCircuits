@@ -79,6 +79,7 @@ def export_elmer_json(
     sim_data = simulation.get_simulation_data()
     sol_data = solution.get_solution_data()
     full_name = simulation.name + solution.name
+    parent_name = sim_data.get("parent_simulation", "") + sol_data.get("parent_solution", "")
 
     if is_cross_section:
         sif_names = [f"{full_name}_C"]
@@ -103,6 +104,7 @@ def export_elmer_json(
         **sol_data,
         "sif_names": sif_names,
         "gds_file": gds_file,
+        "parent_name": parent_name,
         "parameters": get_combined_parameters(simulation, solution),
     }
 
@@ -643,6 +645,9 @@ def export_elmer(
                 )
                 break
 
+    if workflow["delete_meshes"] and any(mesh_reuse_name):
+        raise NotImplementedError('workflow["delete_meshes"] is not supported with Solution sweeps')
+
     json_filenames = []
     for simulation, solution, mesh_reuse in zip(sim_objects, sol_objects, mesh_reuse_name):
         validate_simulation(simulation, solution)
@@ -770,6 +775,8 @@ def _update_elmer_workflow(simulations, common_solution, workflow):
         workflow["elmer_n_processes"] = n_processes
         workflow["elmer_n_threads"] = n_threads
         workflow["gmsh_n_threads"] = gmsh_n_threads
+
+        workflow["delete_meshes"] = workflow.get("delete_meshes", False)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-q", "--quiet", action="store_true")

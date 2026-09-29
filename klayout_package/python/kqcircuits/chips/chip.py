@@ -19,10 +19,10 @@
 # TODO: Consider refactoring to reduce number of public methods
 
 import logging
+
 import numpy
 
 from kqcircuits.defaults import (
-    default_layers,
     default_junction_type,
     default_sampleholders,
     default_mask_parameters,
@@ -31,16 +31,16 @@ from kqcircuits.defaults import (
 )
 from kqcircuits.elements.chip_frame import ChipFrame
 from kqcircuits.elements.element import Element
+from kqcircuits.elements.flip_chip_connectors.flip_chip_connector import FlipChipConnector
 from kqcircuits.elements.launcher import Launcher
 from kqcircuits.elements.launcher_dc import LauncherDC
+from kqcircuits.elements.tsvs.tsv import Tsv
 from kqcircuits.pya_resolver import pya
+from kqcircuits.test_structures.junction_test_pads.junction_test_pads import JunctionTestPads
+from kqcircuits.util.chip_helpers import produce_instance_name_labels
+from kqcircuits.util.groundgrid import insert_ground_grid
 from kqcircuits.util.merge import merge_layout_layers_on_face
 from kqcircuits.util.parameters import Param, pdt, add_parameters_from, add_parameter
-from kqcircuits.test_structures.junction_test_pads.junction_test_pads import JunctionTestPads
-from kqcircuits.test_structures.stripes_test import StripesTest
-from kqcircuits.util.groundgrid import insert_ground_grid
-from kqcircuits.elements.tsvs.tsv import Tsv
-from kqcircuits.elements.flip_chip_connectors.flip_chip_connector import FlipChipConnector
 
 
 @add_parameters_from(Tsv, "tsv_type")
@@ -192,49 +192,6 @@ class Chip(Element):
         self.insert_cell(junction_tests_w, pya.DTrans(0, False, (10e3 - 2.5e3) / 2, 0.35e3), "testarray_s")
         self.insert_cell(junction_tests_h, pya.DTrans(0, False, 9.65e3 - 1.3e3, (10e3 - 2.5e3) / 2), "testarray_e")
         self.insert_cell(junction_tests_w, pya.DTrans(0, False, (10e3 - 2.5e3) / 2, 9.65e3 - 1.3e3), "testarray_n")
-
-    def produce_opt_lit_tests(self):
-        """Produces optical lithography test stripes at chip corners."""
-
-        num_stripes = 20
-        length = 100
-        min_width = 1
-        max_width = 15
-        step = 3
-        first_stripes_width = 2 * num_stripes * min_width
-
-        combined_cell = self.layout.create_cell("Stripes")
-        for i, width in enumerate(numpy.arange(max_width + 0.1 * step, min_width, -step)):
-            stripes_cell = self.add_element(
-                StripesTest, num_stripes=num_stripes, stripe_width=width, stripe_length=length
-            )
-            # horizontal
-            combined_cell.insert(
-                pya.DCellInstArray(
-                    stripes_cell.cell_index(),
-                    pya.DCplxTrans(1, 0, False, -880, 2 * i * length + first_stripes_width - 200),
-                )
-            )
-            # vertical
-            combined_cell.insert(
-                pya.DCellInstArray(
-                    stripes_cell.cell_index(),
-                    pya.DCplxTrans(1, 90, False, 2 * i * length + length + first_stripes_width - 200, -880),
-                )
-            )
-            # diagonal
-            diag_offset = 2 * num_stripes * width / numpy.sqrt(8)
-            combined_cell.insert(
-                pya.DCellInstArray(
-                    stripes_cell.cell_index(),
-                    pya.DCplxTrans(1, -45, False, 250 + i * length - diag_offset, 250 + i * length + diag_offset),
-                )
-            )
-
-        self.insert_cell(combined_cell, pya.DCplxTrans(1, 0, False, 1500, 1500))
-        self.insert_cell(combined_cell, pya.DCplxTrans(1, 90, False, 8500, 1500))
-        self.insert_cell(combined_cell, pya.DCplxTrans(1, 180, False, 8500, 8500))
-        self.insert_cell(combined_cell, pya.DCplxTrans(1, 270, False, 1500, 8500))
 
     def produce_ground_grid(self):
         """Produces ground grid on all faces with ChipFrames.
@@ -406,12 +363,13 @@ class Chip(Element):
         """
         return self.make_grid_locations(bump_box, delta_x=self.bump_grid_spacing, delta_y=self.bump_grid_spacing)
 
-    @classmethod
-    def _get_ground_bump_element(cls):
+    def _get_ground_bump_element(self):
         """Return the element which will be used for the ground bumps"""
         return FlipChipConnector
 
-    def _produce_ground_bumps(self, faces=[0, 1], extra_filter_regions=[]):  # pylint: disable=dangerous-default-value
+    def _produce_ground_bumps(
+        self, faces=[0, 1], extra_filter_regions=[], bump_box=None
+    ):  # pylint: disable=dangerous-default-value
         """Produces a grid of indium bumps between given faces.
 
         The bumps avoid ground grid avoidance on both faces, and keep a minimum distance to existing bumps.
@@ -433,7 +391,8 @@ class Chip(Element):
             + [("through_silicon_via", face, self.tsv_edge_to_nearest_element) for face in faces]
             + extra_filter_regions
         )
-        bump_box = self.get_box(1).enlarged(pya.DVector(-self.edge_from_bump, -self.edge_from_bump))
+        if not bump_box:
+            bump_box = self.get_box(1).enlarged(pya.DVector(-self.edge_from_bump, -self.edge_from_bump))
         locations = self.get_ground_bump_locations(bump_box)
 
         # Produce bump grid
@@ -465,24 +424,7 @@ class Chip(Element):
         self._produce_instance_name_labels()
 
     def _produce_instance_name_labels(self):
-
-        for inst in self.cell.each_inst():
-            inst_id = inst.property("id")
-            if inst_id:
-                cell = self.layout.create_cell(
-                    "TEXT", "Basic", {"layer": default_layers["instance_names"], "text": inst_id, "mag": 400.0}
-                )
-                label_trans = inst.dcplx_trans
-                # prevent the label from being upside-down or mirrored
-                if 90 < label_trans.angle < 270:
-                    label_trans.angle += 180
-                label_trans.mirror = False
-                # optionally apply relative transformation to the label
-                rel_label_trans_str = inst.property("label_trans")
-                if rel_label_trans_str is not None:
-                    rel_label_trans = pya.DCplxTrans.from_s(rel_label_trans_str)
-                    label_trans = label_trans * rel_label_trans
-                self.insert_cell(cell, label_trans)
+        produce_instance_name_labels(self.cell)
 
     def produce_launchers(self, sampleholder_type, launcher_assignments=None, enabled=None, face_id=0):
         """Produces launchers for typical sample holders and sets chip size (``self.box``) accordingly.
@@ -681,22 +623,21 @@ class Chip(Element):
                 locations.append(box.center() + pya.DPoint(x0 + i * delta_x, y0 + j * delta_y))
         return locations
 
-    def get_ground_tsv_locations(self, tsv_box):
+    def get_ground_tsv_locations(self, tsv_box, **kwargs):
+        # pylint: disable=unused-argument
         """
         Define the locations for a grid. This method returns the full grid.
 
         Args:
             box: DBox specifying the region that should be filled with TSVs
+            kwargs: additional keyword arguments
 
         Returns: list of DPoint coordinates where a ground bump can be placed
         """
         return self.make_grid_locations(tsv_box, delta_x=self.tsv_grid_spacing, delta_y=self.tsv_grid_spacing)
 
     def _produce_ground_tsvs(
-        self,
-        tsv_box=None,
-        faces=[0, 2],
-        extra_filter_regions=[],
+        self, tsv_box=None, faces=[0, 2], extra_filter_regions=[], **kwargs
     ):  # pylint: disable=dangerous-default-value
         """Produces a grid of TSVs between given faces.
 
@@ -704,6 +645,8 @@ class Chip(Element):
         Args:
             tsv_box: DBox specifying the region that should be filled with TSVs
             faces: indices of faces in self.face_ids that should have the TSVs
+            extra_filter_regions: extra inputs lists to self.get_filter_regions
+            kwargs: auxiliary inputs to be passed to self.get_ground_tsv_locations
         Returns: list of DPoint coordinates where a ground TSVs will be placed
         """
         logging.info(f"Starting TSV grid generation on face(s) {[self.face_ids[face] for face in faces]}")
@@ -728,7 +671,7 @@ class Chip(Element):
 
         if tsv_box is None:
             tsv_box = self.box.enlarged(-self.edge_from_tsv)
-        locations = self.get_ground_tsv_locations(tsv_box)
+        locations = self.get_ground_tsv_locations(tsv_box, **kwargs)
 
         # Produce TSV grid
         if isinstance(locations, dict):

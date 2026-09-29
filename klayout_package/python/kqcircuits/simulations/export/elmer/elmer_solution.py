@@ -51,6 +51,9 @@ class ElmerSolution(Solution):
         mesh_optimizer: Dictionary to determine mesh optimization, or None to ignore optimization. The dictionary can
             contain keywords 'method', 'force', 'niter' and 'dimTags'. See Gmsh manual (gmsh.model.mesh.optimize) for
             details. The default value is {'method': 'Netgen'}.
+        mesh_options: Dictionary of additional meshing options. The key of every item must be the full name of the gmsh
+            option and the value is then the corresponding option value to be set. For a list of available options,
+            refer to https://gmsh.info/doc/texinfo/gmsh.html#Gmsh-options.
         vtu_output: Output vtu files to view fields in Paraview.
                     Turning this off will make the simulations slightly faster
         save_elmer_data: Save the full Elmer model after simulation. This can be used to restart the simulation
@@ -73,6 +76,7 @@ class ElmerSolution(Solution):
                         If using multigrid, the preconditioning is applied on the lowest iteration level.
         abort_not_converged: Stop Elmer execution immediately if an iterative linear system solver fails to reach
             convergence. If False, a warning is printed after the simulation finishes.
+        parent_solution: parent solution name to be used together with Simulation.parent_simulation
 
         use_multigrid_solver: Use hierarchical iterative multigrid solver.
         mg_smoother: Choice of smoother in multigrid solver. Tested options for electrostatic simulations are
@@ -96,6 +100,7 @@ class ElmerSolution(Solution):
     mesh_levels: int = 1
     mesh_size: dict = field(default_factory=dict)
     mesh_optimizer: dict | None = field(default_factory=lambda: {"method": "Netgen"})
+    mesh_options: dict = field(default_factory=dict)
     vtu_output: bool = True
     save_elmer_data: bool = False
     min_mesh_quality: float = 5e-7
@@ -105,6 +110,7 @@ class ElmerSolution(Solution):
     max_iterations: int = 500
     linear_system_preconditioning: str = "ILU0"
     abort_not_converged: bool = False
+    parent_solution: str = ""
 
     # Multigrid solver settings
     use_multigrid_solver: bool = True
@@ -122,7 +128,7 @@ class ElmerSolution(Solution):
     def __post_init__(self):
         """Used for automatically setting default values depending on other parameters"""
         if self.mg_smoothing_iterations is None:
-            defaults = {"sgs": 1, "wjacobi": 4, "cjacobi": 4, "cg": 8}
+            defaults = {"sgs": 1, "wjacobi": 4, "cjacobi": 4, "cg": 12}
             object.__setattr__(self, "mg_smoothing_iterations", defaults.get(self.mg_smoother.lower(), 1))
         if self.mesh_optimizer == {}:
             object.__setattr__(self, "mesh_optimizer", {"method": "Netgen"})
@@ -180,6 +186,25 @@ class ElmerVectorHelmholtzSolution(ElmerSolution):
             object.__setattr__(self, "frequency", [float(self.frequency)])
         elif not isinstance(self.frequency, list):
             object.__setattr__(self, "frequency", list(self.frequency))
+
+
+@dataclass(kw_only=True, frozen=True)
+class ElmerEigenmodeSolution(ElmerSolution):
+    """
+    Class for Elmer eigenmode solution parameters
+
+    Args:
+        n_modes: Number of eigenmodes to solve.
+        min_frequency: Minimum allowed eigenmode frequency in GHz
+        quadratic_approximation: Use edge finite elements of second order. Otherwise use first order.
+                                 If False, a direct solver such as `linear_system_method=zmumps` should be used.
+    """
+
+    tool: ClassVar[str] = "eigenmode"
+
+    n_modes: int = 2
+    min_frequency: float = 0.1  # NOTE: sometimes this does not filter zero modes (appears to be some Elmer issue)
+    quadratic_approximation: bool = True
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -257,7 +282,13 @@ def get_elmer_solution(tool="capacitance", **solution_params):
         tool: Determines the subclass of ElmerSolution.
         solution_params: Arguments passed for  ElmerSolution subclass.
     """
-    for c in [ElmerVectorHelmholtzSolution, ElmerCapacitanceSolution, ElmerCrossSectionSolution, ElmerEPR3DSolution]:
+    for c in [
+        ElmerVectorHelmholtzSolution,
+        ElmerCapacitanceSolution,
+        ElmerCrossSectionSolution,
+        ElmerEPR3DSolution,
+        ElmerEigenmodeSolution,
+    ]:
         if tool == c.tool:
             return c(**solution_params)
     raise ValueError(f"No ElmerSolution found for tool={tool}.")
